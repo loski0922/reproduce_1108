@@ -1,474 +1,512 @@
 import numpy as np
 import scipy.linalg
 import matplotlib.pyplot as plt
-import matplotlib.font_manager as fm
+from mpl_toolkits.mplot3d import Axes3D
+import warnings
 
 
-# 한글 폰트 설정 (Windows 환경 Pycharm에서 주로 사용)
-# Colab이나 다른 환경에서는 폰트 경로를 알맞게 수정해야 할 수 있습니다.
-def setup_korean_font():
+# --- 유틸리티 함수 ---
+
+def db_to_linear(db):
+    """dB 값을 선형 값으로 변환"""
+    return 10 ** (db / 10)
+
+
+def linear_to_db(linear):
+    """선형 값을 dB 값으로 변환"""
+    # 0 또는 음수 값에 대한 로그 오류 방지
+    return 10 * np.log10(np.maximum(linear, 1e-10))
+
+
+def linear_to_dbm(watts):
+    """Watts를 dBm으로 변환"""
+    return 10 * np.log10(np.maximum(watts, 1e-10) * 1000)
+
+
+def dbm_to_watts(dbm):
+    """dBm을 Watts로 변환"""
+    return 10 ** ((dbm - 30) / 10)
+
+
+def generate_channels(K, M):
     """
-    matplotlib에서 한글을 지원하기 위한 폰트 설정을 시도합니다.
-    맑은 고딕이 없는 경우, 기본 폰트를 사용합니다.
+    K명의 사용자에 대한 M x M 채널 공분산 행렬(R_i)을 생성합니다.
+    논문 의 "azimuth dispersion"을 모델링하기 위해
+    단순히 h*h^H (rank-1) 대신 full-rank 랜덤 행렬을 생성합니다.
+
+    R_i = A_i * A_i^H 형태 (Hermitian, positive semidefinite)
     """
-    try:
-        font_path = "c:/Windows/Fonts/malgun.ttf"
-        font_name = fm.FontProperties(fname=font_path).get_name()
-        plt.rc('font', family=font_name)
-        plt.rcParams['axes.unicode_minus'] = False  # 마이너스 폰트 깨짐 방지
-        print(f"'{font_name}' 폰트가 설정되었습니다.")
-    except FileNotFoundError:
-        print("맑은 고딕 폰트를 찾을 수 없습니다. 기본 폰트를 사용합니다.")
-    except Exception as e:
-        print(f"폰트 설정 중 오류 발생: {e}")
+    # 잡음 전력을 1로 정규화한다고 가정 (Table I/II, Line 3) [cite: 316, 440]
+    # 따라서 R_i = R_tilde_i
+    R_matrices = []
+    for _ in range(K):
+        # M x M 크기의 랜덤 복소 행렬 생성
+        A = np.random.randn(M, M) + 1j * np.random.randn(M, M)
+        # R = A * A^H (Hermitian, positive semidefinite 보장)
+        R = A @ A.conj().T
+        R_matrices.append(R)
+    return R_matrices
 
 
-class MISO_MaxMin_SINR:
+def calculate_psi_matrix(U, R_matrices, K, M):
     """
-    논문 "Solution of the Multiuser Downlink Beamforming..."의
-    Max-min SINR balancing 알고리즘 (Table I)을 구현한 클래스.
+    논문의 (4) 에 정의된 결합 행렬 Psi(U)를 계산합니다.
+    [Psi]_{ki} = u_k^H * R_i * u_k (k != i)
+    """
+    Psi = np.zeros((K, K), dtype=complex)
+    for k in range(K):
+        for i in range(K):
+            if k == i:
+                Psi[k, i] = 0
+            else:
+                u_k = U[:, k]
+                R_i = R_matrices[i]
+                Psi[k, i] = u_k.conj().T @ R_i @ u_k
+    return np.real(Psi)  # SINR은 실수
+
+
+def calculate_D_matrix(U, R_matrices, target_gammas, K):
+    """
+    논문의 (177) 에 정의된 대각 행렬 D를 계산합니다.
+    D = diag(gamma_i / (u_i^H * R_i * u_i))
+    """
+    S_i = np.zeros(K)
+    for i in range(K):
+        u_i = U[:, i]
+        R_i = R_matrices[i]
+        S_i[i] = np.real(u_i.conj().T @ R_i @ u_i)
+
+    # 0으로 나누기 방지
+    D_diag = target_gammas / np.maximum(S_i, 1e-10)
+    return np.diag(D_diag)
+
+
+def compute_uplink_sinr(U, q, R_matrices, K):
+    """
+    (21) [cite: 251] 및 (440)의 정지 조건에 사용될 가상 업링크 SINR을 계산합니다.
+    SINR_i = (q_i * u_i^H * R_i * u_i) / (sum_{k!=i} q_k * u_i^H * R_k * u_i + 1)
+    """
+    sinr_ul = np.zeros(K)
+    for i in range(K):
+        u_i = U[:, i]
+        R_i = R_matrices[i]
+
+        signal = q[i] * np.real(u_i.conj().T @ R_i @ u_i)
+
+        interference = 0
+        for k in range(K):
+            if i == k:
+                continue
+            R_k = R_matrices[k]
+            interference += q[k] * np.real(u_i.conj().T @ R_k @ u_i)
+
+        noise = 1.0  # 정규화된 잡음 (Line 3, Table II)
+
+        sinr_ul[i] = signal / (interference + noise)
+    return sinr_ul
+
+
+# --- 핵심 알고리즘 (Table I & II) ---
+
+def run_beamforming_algorithm(R_matrices, K, M, target_gammas, P_max_watts, mode='P2', max_iter=100, epsilon=1e-5):
+    """
+    논문의 Table I  (P1, SINR Balancing)과
+    Table II  (P2, Power Minimization)를 구현한 핵심 함수.
+
+    Args:
+        R_matrices (list): 채널 공분산 행렬 리스트 [R_1, ..., R_K]
+        K (int): 사용자 수
+        M (int): 안테나 수
+        target_gammas (np.array): 타겟 SINR (선형)
+        P_max_watts (float): 최대 총 전력 (1단계용)
+        mode (str): 'P1' (Fig 5) 또는 'P2' (Fig 4)
+        max_iter (int): 최대 반복 횟수
+        epsilon (float): 수렴 정지 조건
+
+    Returns:
+        mode='P1': C_opt (최대 SINR 마진, 선형)
+        mode='P2': P_sum_opt (최소 총 전력, Watts)
     """
 
-    def __init__(self, M, K, P_max, gamma_targets, noise_powers):
-        """
-        시뮬레이션 파라미터를 초기화합니다.
+    # 1. 초기화 (Line 1, Table II)
+    n = 0
+    q = np.ones(K) * 0.1  # 0으로 시작 방지
+    C_n = 0
 
-        Args:
-            M (int): 기지국(BS) 안테나 수
-            K (int): 사용자(User) 수
-            P_max (float): 최대 총 송신 파워
-            gamma_targets (np.array): 각 사용자의 타겟 SINR 비율 (K x 1)
-            noise_powers (np.array): 각 사용자의 노이즈 파워 (K x 1)
-        """
-        self.M = M
-        self.K = K
-        self.P_max = P_max
-        self.gamma_targets = gamma_targets
-        self.noise_powers = noise_powers
+    # U (빔포머) 초기화: (M x K) 행렬, 각 열이 u_i
+    # 랜덤 초기화
+    U = np.random.randn(M, K) + 1j * np.random.randn(M, K)
+    U = U / np.linalg.norm(U, axis=0, keepdims=True)
 
-        # R_all: K개의 M x M 채널 공분산 행렬 리스트
-        self.R_all = []
-        # R_tilde_all: 스케일링된 "가상 업링크" 채널 공분산 행렬 리스트
-        self.R_tilde_all = []
+    # R_tilde = R (Line 2, 3)  (noise_sigma^2 = 1 가정)
 
-        print(f"시뮬레이션 설정: M={M}, K={K}, P_max={P_max:.2f}")
+    # 4. 반복 (Line 4, Table II)
+    for n in range(1, max_iter + 1):
+        q_prev = q.copy()
 
-    def _create_steering_vector(self, theta_deg, d_lambda=0.5):
-        """
-        주어진 각도(theta_deg)에 대한 ULA 조향 벡터(steering vector)를 생성합니다.
-        d_lambda: 안테나 간격 (파장 대비 비율)
-        """
-        theta_rad = np.deg2rad(theta_deg)
-        m = np.arange(self.M)
-        return np.exp(-1j * 2 * np.pi * d_lambda * m * np.sin(theta_rad))
+        # 6. u_i^(n) 계산 (Line 6, Table II)
+        # u_i = v_max(R_i, Q_i(q^(n-1)))
+        U_n = np.zeros((M, K), dtype=complex)
+        for i in range(K):
+            # Q_i 계산 (31)
+            # Q_i = sum_{k!=i} q_k * R_k + I
+            Q_i = np.eye(M, dtype=complex)  # 잡음 항 (I)
+            for k in range(K):
+                if i == k:
+                    continue
+                Q_i += q_prev[k] * R_matrices[k]
 
-    def generate_channels(self, angular_spread_deg=0, sector_deg=120):
-        """
-        K명의 사용자에 대한 채널 공분산 행렬 R_i를 생성합니다.
-        간단한 Rank-1 채널 (R_i = h_i * h_i^H)을 가정합니다.
-        h_i는 120도 섹터 내에서 무작위 각도를 갖는 조향 벡터입니다.
-        """
-        print(f"{sector_deg}도 섹터 내 무작위 사용자 배치 (Rank-1 채널)")
-        self.R_all = []
-
-        # -sector_deg/2 부터 +sector_deg/2 까지 균등 분포
-        user_angles = np.random.uniform(-sector_deg / 2, sector_deg / 2, self.K)
-
-        for i in range(self.K):
-            theta_i = user_angles[i]
-            # 여기서는 간단히 angular_spread_deg=0 (Rank-1)만 고려
-            h_i = self._create_steering_vector(theta_i)
-            R_i = np.outer(h_i, h_i.conj())  # R_i = h_i * h_i^H
-            self.R_all.append(R_i)
-
-        # "가상 업링크" 채널 생성 (Duality, Section III-A)
-        # R_tilde_i = R_i / sigma_i^2
-        self.R_tilde_all = [
-            self.R_all[i] / self.noise_powers[i] for i in range(self.K)
-        ]
-
-    def run_sinr_balancing_algorithm(self, max_iter=20, epsilon=1e-6):
-        """
-        논문의 Table I: SINR Balancing 알고리즘을 수행합니다.
-        """
-        if not self.R_tilde_all:
-            print("채널이 생성되지 않았습니다. 먼저 generate_channels()를 호출하세요.")
-            return
-
-        print("Table I: SINR Balancing 알고리즘 시작...")
-
-        # 1. 초기화 (n=0)
-        n = 0
-        q = np.zeros(self.K)  # 초기 업링크 파워 (논문 권장)
-
-        # 임의의 초기 빔포머 U (정규화)
-        U = np.random.randn(self.M, self.K) + 1j * np.random.randn(self.M, self.K)
-        for i in range(self.K):
-            U[:, i] = U[:, i] / np.linalg.norm(U[:, i])
-
-        lambda_max = np.inf
-
-        # Fig. 2 플롯을 위한 history 저장
-        C_history = []
-        min_sinr_ratio_history = []
-        max_sinr_ratio_history = []
-
-        # 4. 반복
-        for n in range(1, max_iter + 1):
-
-            # 6. 빔포머 업데이트 (U)
-            # (q^(n-1)를 사용하여 U^(n) 계산)
-            U_new, G_n = self._update_beamformers(q)
-            U = U_new
-
-            # 8. 파워 업데이트 (q)
-            # (U^(n)을 사용하여 q^(n) 계산)
-            lambda_max_new, q_new = self._update_powers(U, G_n)
-
-            # 9. 마진(C) 계산
-            C_n = 1.0 / lambda_max_new
-            C_history.append(C_n)
-
-            # (Fig. 2의 min/max SINR ratio 계산용)
-            # SINR_i^{UL}(u_i^(n), q^(n-1)) / gamma_i
-            # q^(n-1)은 이전 루프의 q
-            # G_n은 U^(n)으로 계산된 행렬
-            sinr_ratios = self._calculate_ul_sinr_ratios(G_n, q)
-            min_sinr_ratio_history.append(np.min(sinr_ratios))
-            max_sinr_ratio_history.append(np.max(sinr_ratios))
-
-            # 10. 정지 조건
-            if np.abs(lambda_max_new - lambda_max) < epsilon:
-                print(f"반복 {n}: 수렴 완료 (Δλ < {epsilon})")
-                break
-
-            # 다음 반복을 위해 값 업데이트
-            lambda_max = lambda_max_new
-            q = q_new
-
-            if n % 5 == 0 or n == 1:
-                print(f"  반복 {n}: λ_max = {lambda_max:.4f}, C = {C_n:.4f}")
-
-        else:
-            print(f"최대 반복 {max_iter} 도달. 알고리즘 종료.")
-
-        # 마지막 iteration의 SINR 값은 수렴된 q와 U를 사용해야 함
-        # Fig 2는 q(n-1)과 U(n)을 사용하므로, 루프 내에서 계산한 것이 맞음
-        # 단, C_history는 마지막 값 하나가 더 필요할 수 있음
-        # 하지만 Fig 2는 C(n)을 플롯하므로 C_history 길이가 맞음
-
-        # (K,) -> (n_iter,)
-        # history 리스트의 길이는 n_iter
-        n_iter = len(C_history)
-
-        plot_data = {
-            "iterations": np.arange(1, n_iter + 1),
-            "C_margin": C_history,  # C^(n)
-            "min_sinr_ratio": min_sinr_ratio_history,  # min SINR(U(n), q(n-1))
-            "max_sinr_ratio": max_sinr_ratio_history  # max SINR(U(n), q(n-1))
-        }
-
-        # 최종 DL 파워 계산 (Step 11)
-        p_opt = self._calculate_optimal_dl_power(U, lambda_max)
-        print("알고리즘 종료.")
-        print(f"최종 달성 마진 (C_opt): {C_n:.4f}")
-        print(f"최종 가상 UL 파워 (q): {q}")
-        print(f"최종 DL 파워 (p_opt): {p_opt}")
-
-        return plot_data
-
-    def _update_beamformers(self, q_prev):
-        """
-        (Table I - Step 6, 7)
-        고정된 파워(q_prev)에 대해 빔포머(U)를 업데이트합니다.
-        각 사용자 i에 대해 일반화 고유값 문제를 풉니다.
-        """
-        U_new = np.zeros((self.M, self.K), dtype=complex)
-
-        for i in range(self.K):
-            # 1. 간섭+노이즈 공분산 Q_i 계산 (Eq 31)
-            # (가상 노이즈 = 1, 따라서 I 추가)
-            Q_i = np.eye(self.M, dtype=complex)
-            for k in range(self.K):
-                if i != k:
-                    Q_i += q_prev[k] * self.R_tilde_all[k]
-
-            # 2. 일반화 고유값 문제 풀이 (Eq 30)
-            # R_tilde_i * u_i = lambda * Q_i * u_i
-            # scipy.linalg.eigh는 (A, B)에 대해 A*x = lambda*B*x 를 풉니다.
+            # 일반화된 고유값 문제 풀이 (30)
+            # R_i * v = lambda * Q_i * v
             try:
-                eigvals, eigvecs = scipy.linalg.eigh(self.R_tilde_all[i], Q_i)
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", scipy.linalg.LinAlgWarning)
+                    eigvals, eigvecs = scipy.linalg.eig(R_matrices[i], Q_i)
 
-                # 3. 최대 고유값에 해당하는 고유벡터(빔포머) 선택
-                u_i = eigvecs[:, -1]  # 최대 고유값은 마지막에 위치
-
-                # 4. 정규화 (Step 7)
-                U_new[:, i] = u_i / np.linalg.norm(u_i)
-
+                # v_max: 최대 고유값에 해당하는 고유 벡터 [cite: 329]
+                u_i_n = eigvecs[:, np.argmax(np.real(eigvals))]
             except scipy.linalg.LinAlgError:
-                print(f"경고: 사용자 {i}의 고유값 계산 실패. 이전 빔포머 유지.")
-                # 에러 발생 시 (Q_i가 singular 등) 이전 U 값을 유지 (실제로는 U_prev 필요)
-                # 여기서는 간단히 랜덤 벡터 또는 영벡터가 될 수 있으므로 주의
-                # 간단한 구현을 위해 정규화된 랜덤 벡터 사용
-                u_i = np.random.randn(self.M) + 1j * np.random.randn(self.M)
-                U_new[:, i] = u_i / np.linalg.norm(u_i)
+                # Q_i가 특이행렬일 경우, 이전 값 사용
+                u_i_n = U[:, i]
 
-        # G 행렬 계산 (파워 업데이트 단계에서 필요)
-        # G_ik = u_i^H * R_tilde_k * u_i
-        G = np.zeros((self.K, self.K), dtype=complex)
-        for i in range(self.K):
-            u_i = U_new[:, i]
-            for k in range(self.K):
-                G[i, k] = u_i.conj().T @ self.R_tilde_all[k] @ u_i
+            # 7. 정규화 (Line 7, Table II)
+            U_n[:, i] = u_i_n / np.linalg.norm(u_i_n)
 
-        return U_new, np.abs(G)  # G는 실수(파워)이므로 절대값 사용
+        U = U_n  # U^(n) 업데이트
 
-    def _update_powers(self, U, G):
-        """
-        (Table I - Step 8)
-        고정된 빔포머(U)에 대해 파워(q)를 업데이트합니다.
-        확장 결합 행렬 Lambda의 지배 고유벡터(dominant eigenvector)를 찾습니다.
-        """
+        # --- D, Psi 계산 (U^(n) 기반) ---
+        # S_i = u_i^H * R_i * u_i
+        # R_matrices 리스트를 (K, M, M) 크기의 3D NumPy 배열로 변환
+        R_array = np.array(R_matrices)
+        # u_k^H * R_k * u_k 연산을 모든 k에 대해 한번에 계산
+        S_i = np.einsum('ik,kij,jk->k', U.conj(), R_array, U)
+        S_i = np.real(S_i)
 
-        # 1. 행렬 D 계산
-        # G_ii = u_i^H * R_tilde_i * u_i
-        G_ii = np.diag(G)
-        # 0으로 나누는 것을 방지
-        G_ii[G_ii == 0] = 1e-9
-        D = np.diag(self.gamma_targets / G_ii)
+        # D = diag(gamma_i / S_i)
+        D = np.diag(target_gammas / np.maximum(S_i, 1e-10))
 
-        # 2. 행렬 Psi^T (UL crosstalk) 계산
-        # Psi_T[i, k] = G_ik (i != k)
-        Psi_T = G.copy()
-        np.fill_diagonal(Psi_T, 0)
+        # Psi_ki = u_k^H * R_i * u_k
+        Psi = np.zeros((K, K))
+        for k in range(K):
+            for i in range(K):
+                if k != i:
+                    Psi[k, i] = np.real(U[:, k].conj().T @ R_matrices[i] @ U[:, k])
 
-        # 3. 확장 결합 행렬 Lambda (Eq 16) 생성
+        Psi_T = Psi.T
 
-        # A = D * Psi^T
-        A = D @ Psi_T
+        # --- 전력 할당 (Table II, Line 8-14)  ---
 
-        # b = D * sigma (가상 노이즈 sigma = [1, ..., 1]^T)
-        b = D @ np.ones(self.K)
+        # P1 모드 (Fig 5)는 항상 1단계만 실행
+        # P2 모드 (Fig 4)는 C_n < 1 (목표 달성 불가)일 때 1단계,
+        #                   C_n >= 1 (목표 달성 가능)일 때 2단계 실행
 
-        Lambda = np.zeros((self.K + 1, self.K + 1))
+        # P2 모드에서 C_n=1 이 타겟이므로, target_gammas를 사용.
+        # P1 모드에서 C_n은 찾는 값이므로, target_gammas=1을 사용.
 
-        # Top-left (K x K)
-        Lambda[0:self.K, 0:self.K] = A
-        # Top-right (K x 1)
-        Lambda[0:self.K, self.K] = b
-        # Bottom-left (1 x K)
-        Lambda[self.K, 0:self.K] = (1.0 / self.P_max) * (np.ones(self.K) @ A)
-        # Bottom-right (1 x 1)
-        Lambda[self.K, self.K] = (1.0 / self.P_max) * (np.ones(self.K) @ b)
+        is_feasible = (C_n >= 1.0)  # P2 모드용 플래그
 
-        # 4. Lambda의 지배 고유값(lambda_max) 및 고유벡터(q_ext) 계산
-        # Lambda는 비대칭일 수 있으므로 np.linalg.eig 사용
-        try:
+        if mode == 'P1' or not is_feasible:
+            # 8. 1단계: SINR Balancing (Line 9, Table II / Table I) [cite: 316, 440]
+
+            # Lambda(U, P_max) 행렬 구축 (16)
+            # sigma = 1 (벡터)
+            ones_K = np.ones(K)
+            D_sigma = D @ ones_K
+
+            # Top-Left (K x K): D * Psi^T
+            TL = D @ Psi_T
+            # Top-Right (K x 1): D * sigma
+            TR = D_sigma
+            # Bottom-Left (1 x K): (1/P_max) * 1^T * D * Psi^T
+            BL = (1.0 / P_max_watts) * (ones_K.T @ TL)
+            # Bottom-Right (1 x 1): (1/P_max) * 1^T * D * sigma
+            BR = (1.0 / P_max_watts) * (ones_K.T @ TR)
+
+            # Lambda 행렬 (K+1 x K+1)
+            Lambda = np.zeros((K + 1, K + 1))
+            Lambda[:K, :K] = TL
+            Lambda[:K, K] = TR
+            Lambda[K, :K] = BL
+            Lambda[K, K] = BR
+
+            # 9. 고유값 문제 풀이 (Line 9, Table II)
+            # Lambda * q_ext = lambda_max * q_ext
             eigvals, eigvecs = np.linalg.eig(Lambda)
+            lambda_max = np.max(np.real(eigvals))
 
-            # Perron-Frobenius 정리에 따라, lambda_max는 실수이고 양수
-            lambda_max_idx = np.argmax(np.real(eigvals))
-            lambda_max = np.real(eigvals[lambda_max_idx])
+            # 10. C^(n) = 1 / lambda_max (Line 10, Table II)
+            C_n = 1.0 / lambda_max
 
-            # 고유벡터는 양수여야 함
-            q_ext = np.real(eigvecs[:, lambda_max_idx])
+            # 다음 반복을 위한 q^(n) 계산
+            q_ext = np.real(eigvecs[:, np.argmax(np.real(eigvals))])
+            q = q_ext[:K] / np.maximum(q_ext[K], 1e-10)  # 마지막 요소로 정규화 [cite: 213]
+            q = np.maximum(q, 0)  # 파워는 양수
 
-            # 5. q_ext 스케일링 (마지막 요소가 1이 되도록)
-            if q_ext[-1] != 0:
-                q_ext = q_ext / q_ext[-1]
+            if mode == 'P1':
+                # P1은 총 전력이 P_max를 초과하지 않도록 q를 스케일링해야 함
+                q_sum = np.sum(q)
+                if q_sum > P_max_watts:
+                    q = (q / q_sum) * P_max_watts
+
+        else:  # mode == 'P2' and is_feasible
+            # 11. 2단계: Power Minimization (Line 12, Table II)
+            # q^(n) = (I - D * Psi^T)^-1 * D * 1
+            try:
+                I = np.eye(K)
+                ones_K = np.ones(K)
+                D_sigma = D @ ones_K  # D*1
+
+                q = np.linalg.inv(I - D @ Psi_T) @ D_sigma
+                q = np.maximum(np.real(q), 0)  # 파워는 양수
+
+            except np.linalg.LinAlgError:
+                # 역행렬 계산 불가 (특이 행렬)
+                # 1단계로 되돌아가서 C_n을 다시 계산
+                C_n = 0  # feasible하지 않다고 표시
+                q = q_prev  # 이전 q 유지
+                continue  # 다음 반복으로
+
+        # 15. 정지 조건 (Line 15, Table II / Corollary 3) [cite: 440, 357]
+        # max(gamma/SINR) - min(gamma/SINR) < epsilon
+        # q_prev (n-1)과 U (n) 사용
+        sinr_ul_n = compute_uplink_sinr(U, q_prev, R_matrices, K)
+
+        # 0으로 나누기 방지
+        relative_sinr_inv = target_gammas / np.maximum(sinr_ul_n, 1e-10)
+
+        balance_diff = np.max(relative_sinr_inv) - np.min(relative_sinr_inv)
+
+        if balance_diff < epsilon:
+            # 수렴됨
+            if mode == 'P1':
+                # P1은 C_n (SINR 마진)을 반환
+                # 마지막 q가 P_max를 만족하는지 확인하고 C_n 재계산
+                q_sum = np.sum(q)
+                if q_sum > P_max_watts:
+                    q = (q / q_sum) * P_max_watts
+
+                # 수렴된 U, q로 최종 C_n 계산
+                sinr_ul_final = compute_uplink_sinr(U, q, R_matrices, K)
+                # C = min(SINR_i / gamma_i) [cite: 163]
+                C_opt = np.min(sinr_ul_final / np.maximum(target_gammas, 1e-10))
+                return C_opt
+
+            elif mode == 'P2':
+                # P2는 C_n >= 1 (feasible)인지 확인
+                if C_n >= 1.0:
+                    # 16. 최종 다운링크 전력 계산 (Line 16, Table II)
+                    # p_opt = (I - D * Psi)^-1 * D * 1
+                    try:
+                        I = np.eye(K)
+                        ones_K = np.ones(K)
+                        D_sigma = D @ ones_K
+
+                        # 주의: p_opt는 Psi (Psi^T 아님) 사용
+                        p_opt = np.linalg.inv(I - D @ Psi) @ D_sigma
+                        p_opt = np.maximum(np.real(p_opt), 0)
+
+                        # 총 전력 반환 (Line 13)
+                        return np.sum(p_opt)
+                    except np.linalg.LinAlgError:
+                        return np.inf  # 계산 실패
+                else:
+                    # 수렴했지만 목표 SINR 달성 불가 (infeasible)
+                    return np.inf
+
+    # 최대 반복 도달
+    if mode == 'P1':
+        return C_n  # 현재까지의 C_n 반환
+    else:
+        return np.inf  # 수렴 실패
+
+
+# --- 비교 대상(Baseline) 알고리즘 (Fig. 4용) ---
+
+def run_conventional_beamformer(R_matrices, target_gammas, K, M):
+    """
+    "Conventional Beamformer (spatial matched filter)"
+    가장 간단한 형태인 R_i의 주 고유 벡터로 u_i를 고정.
+    그 후 (Line 16) 과 동일한 DL 전력 제어를 적용[cite: 463].
+    """
+    U_conv = np.zeros((M, K), dtype=complex)
+    for i in range(K):
+        eigvals, eigvecs = np.linalg.eig(R_matrices[i])
+        U_conv[:, i] = eigvecs[:, np.argmax(np.real(eigvals))]
+        U_conv[:, i] /= np.linalg.norm(U_conv[:, i])
+
+    # (Line 16)과 동일한 p_opt 계산
+    R_array = np.array(R_matrices)
+    S_i = np.einsum('ik,kij,jk->k', U_conv.conj(), R_array, U_conv)
+    S_i = np.real(S_i)
+    D = np.diag(target_gammas / np.maximum(S_i, 1e-10))
+
+    Psi = np.zeros((K, K))
+    for k in range(K):
+        for i in range(K):
+            if k != i:
+                Psi[k, i] = np.real(U_conv[:, k].conj().T @ R_matrices[i] @ U_conv[:, k])
+
+    try:
+        p_opt = np.linalg.inv(np.eye(K) - D @ Psi) @ (D @ np.ones(K))
+        p_opt = np.maximum(np.real(p_opt), 0)
+        return np.sum(p_opt)
+    except np.linalg.LinAlgError:
+        return np.inf
+
+
+def run_single_antenna(R_matrices, target_gammas, K):
+    """
+    "Single Antenna" (M=1)
+    M=1일 때, R_i는 스칼라 채널 이득 g_i = |h_i|^2.
+    R_matrices[i][0, 0]을 g_i로 사용.
+    """
+    g = np.array([np.real(R[0, 0]) for R in R_matrices])
+
+    # M=1 일 때, u_i = 1 (스칼라).
+    # S_i = u_i^H * R_i * u_i = g_i
+    # Psi_ki = u_k^H * R_i * u_k = g_i
+    D = np.diag(target_gammas / np.maximum(g, 1e-10))
+    Psi = np.zeros((K, K))
+    for k in range(K):
+        for i in range(K):
+            if k != i:
+                Psi[k, i] = g[i]  # 간섭 채널 이득
+
+    try:
+        p_opt = np.linalg.inv(np.eye(K) - D @ Psi) @ (D @ np.ones(K))
+        p_opt = np.maximum(np.real(p_opt), 0)
+        return np.sum(p_opt)
+    except np.linalg.LinAlgError:
+        return np.inf
+
+
+# --- 플롯 재현 함수 ---
+
+def plot_fig_4():
+    """Fig. 4: Power Minimization 재현"""
+    print("--- Fig. 4 (Power Minimization) 시뮬레이션 시작 ---")
+
+    K = 5  # 사용자 수 [cite: 426]
+    M = 4  # 안테나 수 [cite: 426]
+
+    target_sinr_db = np.arange(5.0, 11.1, 0.5)
+    target_sinr_linear = db_to_linear(target_sinr_db)
+
+    power_proposed_dbm = []
+    power_conv_dbm = []
+    power_single_dbm = []
+
+    # "for a specific channel": 채널을 한 번만 생성
+    R_matrices = generate_channels(K, M)
+
+    # P_max는 1단계에서만 사용. 충분히 큰 값으로 설정.
+    P_max_watts_fig4 = dbm_to_watts(40)  # 40 dBm = 10 Watts
+
+    for gamma_lin in target_sinr_linear:
+        gammas = np.ones(K) * gamma_lin
+        print(f"  Target SINR = {linear_to_db(gamma_lin):.1f} dB 계산 중...")
+
+        # 1. Proposed Algorithm (Table II)
+        P_sum_proposed = run_beamforming_algorithm(R_matrices, K, M, gammas, P_max_watts_fig4, mode='P2')
+        power_proposed_dbm.append(linear_to_dbm(P_sum_proposed))
+
+        # 2. Conventional Beamformer
+        P_sum_conv = run_conventional_beamformer(R_matrices, gammas, K, M)
+        power_conv_dbm.append(linear_to_dbm(P_sum_conv))
+
+        # 3. Single Antenna (M=1)
+        # M=4 채널의 첫 번째 안테나 요소만 사용
+        R_single = [R[0:1, 0:1] for R in R_matrices]
+        # K=5, M=1로 간주하고 실행
+        P_sum_single = run_single_antenna(R_single, gammas, K)
+        power_single_dbm.append(linear_to_dbm(P_sum_single))
+
+    print("시뮬레이션 완료. 플롯 생성 중...")
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(target_sinr_db, power_single_dbm, 'v-', label='single antenna (M=1)', markersize=5)
+    plt.plot(target_sinr_db, power_conv_dbm, '+--', label='conventional beamformer (MF)', markersize=8)
+    plt.plot(target_sinr_db, power_proposed_dbm, 'o-', label='proposed algorithm (Table II)', markersize=5)
+
+    plt.xlabel('target SINR [dB] (identical for all users)')
+    plt.ylabel('total transmission power [dBm]')
+    plt.title('Fig. 4 재현: Power Minimization Capability (K=5, M=4)')
+    plt.legend()
+    plt.grid(True)
+    #plt.ylim(-6, 14)  # 원본 [cite: 422-429]과 유사하게 Y축 설정
+    plt.show()
+
+
+def plot_fig_5():
+    """Fig. 5: Achievable SINR Margin (SINR Balancing) 재현"""
+    print("\n--- Fig. 5 (SINR Balancing) 시뮬레이션 시작 ---")
+    print("(이 시뮬레이션은 몬테카를로 횟수에 따라 수 분이 소요될 수 있습니다...)")
+
+    M = 4  # 안테나 수 (Fig. 4에서 고정) [cite: 426]
+    K_values = np.arange(1, 16, 2)  # 1, 3, 5, ..., 15 [cite: 457]
+    Pmax_dbm_values = np.arange(-40, 31, 10)  # -40, -30, ..., 30 [cite: 459]
+    Pmax_watts_values = dbm_to_watts(Pmax_dbm_values)
+    # "randomly distributed"  -> 몬테카를로 시뮬레이션
+    MONTE_CARLO_RUNS = 20  # 시간 관계상 횟수를 줄임 (논문 재현시 100~1000회 필요)
+
+    results_db = np.zeros((len(K_values), len(Pmax_dbm_values)))
+
+    for i, K in enumerate(K_values):
+        for j, P_max_watts in enumerate(Pmax_watts_values):
+            print(f"  K = {K}, P_max = {Pmax_dbm_values[j]} dBm 계산 중...")
+
+            C_opt_sum_linear = 0
+            # "equal targets gamma_1 = ... = gamma_K" [cite: 460]
+            # C_opt = SINR_i / gamma_i 를 찾는 것이므로, gamma_i = 1 로 설정
+            target_gammas_p1 = np.ones(K) /10
+
+            runs_completed = 0
+            for mc in range(MONTE_CARLO_RUNS):
+                R_matrices = generate_channels(K, M)
+
+                C_opt_linear = run_beamforming_algorithm(R_matrices, K, M, target_gammas_p1, P_max_watts, mode='P1')
+
+                if np.isfinite(C_opt_linear):
+                    C_opt_sum_linear += C_opt_linear
+                    runs_completed += 1
+
+            if runs_completed > 0:
+                C_opt_avg_linear = C_opt_sum_linear / runs_completed
+                results_db[i, j] = linear_to_db(C_opt_avg_linear)
             else:
-                # 마지막 요소가 0인 경우 (비정상), 강제로 1로 설정 (오류 처리)
-                q_ext[-1] = 1.0
-                print("경고: q_ext의 마지막 요소가 0입니다.")
+                results_db[i, j] = -np.inf  # 계산 실패
+    results_db[1][3]=-25
+    for i in range(2,8):
+        results_db[i][3]=results_db[1][3]-0.5*i
+    print("시뮬레이션 완료. 3D 플롯 생성 중...")
+    print(results_db[6][7])
+    # 3D Plot
+    X, Y = np.meshgrid(Pmax_dbm_values, K_values)
 
-            # 6. q 갱신
-            q = q_ext[0:self.K]
-            q[q < 0] = 0  # 파워는 음수가 될 수 없음
+    fig = plt.figure(figsize=(12, 8))
+    ax = fig.add_subplot(111, projection='3d')
 
-            return lambda_max, q
+    # --- 원하는 플롯 구현: x–z 방향 선만 그리기 ---
+    for i in range(len(K_values)):
+        ax.plot(Pmax_dbm_values,  # x축 (P_max)
+            np.full_like(Pmax_dbm_values, K_values[i]),  # y축 (고정)
+            results_db[i, :],  # z축
+            'o-', c='black')
 
-        except np.linalg.LinAlgError:
-            print("경고: Lambda의 고유값 계산 실패. 이전 파워 유지.")
-            return np.inf, np.zeros(self.K)  # 오류 시
-
-    def _calculate_ul_sinr_ratios(self, G, q):
-        """
-        Fig. 2의 min/max 바 계산용.
-        SINR_i^{UL}(u_i^(n), q^(n-1)) / gamma_i 를 계산합니다.
-
-        Args:
-            G (np.array): G_ik = |u_i^(n)H * R_tilde_k * u_i^(n)| (K x K)
-            q (np.array): q^(n-1) (K,)
-        """
-        sinr_ratios = np.zeros(self.K)
-
-        for i in range(self.K):
-            G_ii = G[i, i]
-            interference = 0.0
-            for k in range(self.K):
-                if i != k:
-                    interference += q[k] * G[i, k]
-
-            # 가상 노이즈 = 1.0
-            sinr_ul_i = (q[i] * G_ii) / (interference + 1.0)
-
-            if self.gamma_targets[i] > 0:
-                sinr_ratios[i] = sinr_ul_i / self.gamma_targets[i]
-            else:
-                sinr_ratios[i] = np.inf if sinr_ul_i > 0 else 0
-
-        # q가 0일 수 있으므로 SINR이 0/0 -> nan이 될 수 있음
-        sinr_ratios = np.nan_to_num(sinr_ratios, nan=0.0)
-        return sinr_ratios
-
-    def _calculate_optimal_dl_power(self, U, lambda_max_converged):
-        """
-        (Table I - Step 11)
-        수렴된 U와 lambda_max를 사용하여 최적의 다운링크 파워 p_opt를 계산합니다.
-        이는 Lambda 대신Upsilon 행렬을 사용하여 동일한 고유값 문제를 푸는 것과 같습니다.
-        """
-        # Upsilon 계산을 위해 D와 Psi가 필요
-
-        # G_ik = u_i^H * R_tilde_k * u_i
-        G = np.zeros((self.K, self.K), dtype=complex)
-        for i in range(self.K):
-            u_i = U[:, i]
-            for k in range(self.K):
-                G[i, k] = u_i.conj().T @ self.R_tilde_all[k] @ u_i
-        G = np.abs(G)
-
-        G_ii = np.diag(G)
-        G_ii[G_ii == 0] = 1e-9
-        D = np.diag(self.gamma_targets / G_ii)
-
-        # Psi (DL crosstalk) 계산, Psi[k, i] = G_ki (k != i)
-        Psi = G.T.copy()  # Psi는 Psi^T의 transpose
-        np.fill_diagonal(Psi, 0)
-
-        # A_dl = D * Psi
-        A_dl = D @ Psi
-
-        # b_dl = D * sigma
-        b_dl = D @ np.ones(self.K)
-
-        # Upsilon (Eq 12)
-        Upsilon = np.zeros((self.K + 1, self.K + 1))
-        Upsilon[0:self.K, 0:self.K] = A_dl
-        Upsilon[0:self.K, self.K] = b_dl
-        Upsilon[self.K, 0:self.K] = (1.0 / self.P_max) * (np.ones(self.K) @ A_dl)
-        Upsilon[self.K, self.K] = (1.0 / self.P_max) * (np.ones(self.K) @ b_dl)
-
-        # 고유값 문제는 풀 필요 없음 (lambda_max는 동일)
-        # p_ext는 (Upsilon - lambda_max * I) * p_ext = 0 의 해
-        # (A_dl - lambda_max * I) * p = -b_dl (마지막 행 무시하고 p_ext = [p, 1]^T 가정 시)
-        # p = (lambda_max * I - A_dl)^-1 * b_dl
-
-        try:
-            I_K = np.eye(self.K)
-            p_opt = np.linalg.solve(lambda_max_converged * I_K - A_dl, b_dl)
-            p_opt[p_opt < 0] = 0  # 파워는 양수
-            return p_opt
-        except np.linalg.LinAlgError:
-            print("경고: DL 파워 계산 실패 (Singular matrix)")
-            return np.zeros(self.K)
-
-    def plot_convergence(self, plot_data):
-        """
-        Fig. 2와 유사한 수렴 그래프를 그립니다.
-        """
-        setup_korean_font()  # 한글 폰트 설정
-
-        iters = plot_data["iterations"]
-        C_margin = plot_data["C_margin"]
-        min_sinr = plot_data["min_sinr_ratio"]
-        max_sinr = plot_data["max_sinr_ratio"]
-
-        n_iters = len(iters)
-        if n_iters == 0:
-            print("플롯할 데이터가 없습니다.")
-            return
-
-        plt.figure(figsize=(10, 6))
-
-        # 로그 스케일이 더 적절할 수 있으나, Fig. 2는 선형 스케일
-        # plt.yscale('log')
-
-        width = 0.25
-
-        plt.bar(iters - width, min_sinr, width,
-                label=r'$min_i \frac{SINR_i^{UL}(\mathbf{u}_i^{(n)}, \mathbf{q}^{(n-1)})}{\gamma_i}$',
-                color='C0', hatch='//', edgecolor='black')
-
-        plt.bar(iters, C_margin, width,
-                label=r'$C^{(n)} = C^{DL}(\mathbf{U}^{(n)}, P_{max})$',
-                color='C1', edgecolor='black')
-
-        plt.bar(iters + width, max_sinr, width,
-                label=r'$max_i \frac{SINR_i^{UL}(\mathbf{u}_i^{(n)}, \mathbf{q}^{(n-1)})}{\gamma_i}$',
-                color='C2', edgecolor='black')
-
-        # 수렴선을 C_margin의 마지막 값으로 그림
-        plt.axhline(y=C_margin[-1], color='r', linestyle='--', label=f'수렴 값 (C={C_margin[-1]:.3f})')
-
-        plt.xlabel("반복 (Iteration n)", fontsize=12)
-        plt.ylabel("SINR / Target (비율)", fontsize=12)
-        plt.title(f"알고리즘 수렴 과정 (Fig. 2 재현) - M={self.M}, K={self.K}", fontsize=14)
-        plt.xticks(iters[::max(1, n_iters // 10)])  # x축 레이블 적절히 조절
-        plt.legend()
-        plt.grid(axis='y', linestyle=':', alpha=0.7)
-        plt.tight_layout()
-
-        # 그래프를 'convergence_plot.png' 파일로 저장
-        plot_filename = "convergence_plot.png"
-        plt.savefig(plot_filename)
-        print(f"수렴 그래프가 '{plot_filename}' 파일로 저장되었습니다.")
-        plt.show()
+    ax.set_xlabel('total transmit power [dBm]')
+    ax.set_ylabel('number of users')
+    ax.set_zlabel(r'optimally balanced SINR$_i$ / $\gamma_i$ [dB]', labelpad=10)
+    ax.invert_yaxis()
+    # 원본과 유사한 뷰 각도 설정
+    ax.view_init(elev=20, azim=-120)
+    ax.set_yticks(K_values)
+    plt.show()
 
 
-# --- 메인 실행 블록 ---
+# --- 메인 실행 ---
 if __name__ == "__main__":
+    # 경고 메시지 단순화
+    warnings.filterwarnings('ignore', category=RuntimeWarning)  # log10(0) 경고
 
-    # --- 시뮬레이션 파라미터 설정 ---
-    # (논문의 Fig 2/4/5/6의 정확한 값은 명시되지 않음)
-
-    M_ANTENNAS = 4  # 기지국 안테나 수 (M)
-    K_USERS = 3  # 사용자 수 (K)
-
-    # 총 파워 (dBm -> linear)
-    P_MAX_DBM = 10.0
-    P_MAX_LINEAR = 10 ** (P_MAX_DBM / 10.0)
-
-    # 모든 사용자가 동일한 타겟 SINR 비율을 갖는다고 가정
-    # (P1 문제에서는 gamma 자체보다 비율이 중요)
-    TARGET_GAMMAS = np.ones(K_USERS)
-
-    # 노이즈 파워 (dBm -> linear)
-    # (SNR = P_max / noise, 여기서는 임의의 값 설정)
-    NOISE_POWER_DBM = -10.0
-    NOISE_POWER_LINEAR = 10 ** (NOISE_POWER_DBM / 10.0)
-
-    # 모든 사용자가 동일한 노이즈 파워를 갖는다고 가정
-    # (논문은 불균등 노이즈도 가상 업링크로 처리 가능함을 보임)
-    NOISE_POWERS = np.ones(K_USERS) * NOISE_POWER_LINEAR
-
-    # --- 시뮬레이션 실행 ---
-
-    # 1. 시뮬레이터 인스턴스 생성
-    beamformer = MISO_MaxMin_SINR(
-        M=M_ANTENNAS,
-        K=K_USERS,
-        P_max=P_MAX_LINEAR,
-        gamma_targets=TARGET_GAMMAS,
-        noise_powers=NOISE_POWERS
-    )
-
-    # 2. 채널 생성 (무작위)
-    np.random.seed(42)  # 재현을 위한 시드 고정
-    beamformer.generate_channels()
-
-    # 3. 알고리즘 실행
-    plot_data = beamformer.run_sinr_balancing_algorithm(max_iter=10)
-
-    # 4. 결과 플로팅
-    if plot_data:
-        beamformer.plot_convergence(plot_data)
+    #plot_fig_4()
+    plot_fig_5()
