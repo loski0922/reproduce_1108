@@ -4,9 +4,9 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 import warnings
 
+np.random.seed(0)
 
 # --- 유틸리티 함수 ---
-
 def db_to_linear(db):
     """dB 값을 선형 값으로 변환"""
     return 10 ** (db / 10)
@@ -62,6 +62,7 @@ def calculate_psi_matrix(U, R_matrices, K, M):
                 u_k = U[:, k]
                 R_i = R_matrices[i]
                 Psi[k, i] = u_k.conj().T @ R_i @ u_k
+    print(Psi)
     return np.real(Psi)  # SINR은 실수
 
 
@@ -107,7 +108,6 @@ def compute_uplink_sinr(U, q, R_matrices, K):
 
 
 # --- 핵심 알고리즘 (Table I & II) ---
-
 def run_beamforming_algorithm(R_matrices, K, M, target_gammas, P_max_watts, mode='P2', max_iter=100, epsilon=1e-5):
     """
     논문의 Table I  (P1, SINR Balancing)과
@@ -279,6 +279,7 @@ def run_beamforming_algorithm(R_matrices, K, M, target_gammas, P_max_watts, mode
         if balance_diff < epsilon:
             # 수렴됨
             if mode == 'P1':
+                ##################################################################################################################################
                 # P1은 C_n (SINR 마진)을 반환
                 # 마지막 q가 P_max를 만족하는지 확인하고 C_n 재계산
                 q_sum = np.sum(q)
@@ -290,6 +291,8 @@ def run_beamforming_algorithm(R_matrices, K, M, target_gammas, P_max_watts, mode
                 # C = min(SINR_i / gamma_i) [cite: 163]
                 C_opt = np.min(sinr_ul_final / np.maximum(target_gammas, 1e-10))
                 return C_opt
+                # return C_n
+                ####################################################################################################################################
 
             elif mode == 'P2':
                 # P2는 C_n >= 1 (feasible)인지 확인
@@ -458,7 +461,7 @@ def plot_fig_5():
             C_opt_sum_linear = 0
             # "equal targets gamma_1 = ... = gamma_K" [cite: 460]
             # C_opt = SINR_i / gamma_i 를 찾는 것이므로, gamma_i = 1 로 설정
-            target_gammas_p1 = np.ones(K) /10
+            target_gammas_p1 = np.ones(K)
 
             runs_completed = 0
             for mc in range(MONTE_CARLO_RUNS):
@@ -475,11 +478,8 @@ def plot_fig_5():
                 results_db[i, j] = linear_to_db(C_opt_avg_linear)
             else:
                 results_db[i, j] = -np.inf  # 계산 실패
-    results_db[1][3]=-25
-    for i in range(2,8):
-        results_db[i][3]=results_db[1][3]-0.5*i
+
     print("시뮬레이션 완료. 3D 플롯 생성 중...")
-    print(results_db[6][7])
     # 3D Plot
     X, Y = np.meshgrid(Pmax_dbm_values, K_values)
 
