@@ -324,7 +324,6 @@ def run_beamforming_algorithm(R_matrices, K, M, target_gammas, P_max_watts, mode
 
 
 # --- 비교 대상(Baseline) 알고리즘 (Fig. 4용) ---
-
 def run_conventional_beamformer(R_matrices, target_gammas, K, M):
     """
     "Conventional Beamformer (spatial matched filter)"
@@ -384,7 +383,6 @@ def run_single_antenna(R_matrices, target_gammas, K):
 
 
 # --- 플롯 재현 함수 ---
-
 def plot_fig_4():
     """Fig. 4: Power Minimization 재현"""
     print("--- Fig. 4 (Power Minimization) 시뮬레이션 시작 ---")
